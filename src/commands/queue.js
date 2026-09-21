@@ -18,13 +18,17 @@ function buildEmbed(queue, page, totalPages) {
 
   const list =
     pageSongs
-      .map((s, i) => `**${start + i + 1}.** ${s.title}`)
+      .map((s, i) => `**${start + i + 1}.** ${s.title}${s.requestedBy ? ` — _${s.requestedBy}_` : ''}`)
       .join('\n') || '_Nothing queued_';
+
+  const nowPlayingLine = queue.current
+    ? `${queue.current.title}${queue.current.requestedBy ? ` — _${queue.current.requestedBy}_` : ''}`
+    : '_Nothing_';
 
   return new EmbedBuilder()
     .setTitle('🎵 Queue')
     .setDescription(
-      `**Now Playing:** ${queue.current ? queue.current.title : '_Nothing_'}${queue.loop ? ' 🔁' : ''}\n\n**Up Next (${queue.songs.length} total):**\n${list}`
+      `**Now Playing:** ${nowPlayingLine}${queue.loop ? ' 🔁' : ''}\n\n**Up Next (${queue.songs.length} total):**\n${list}`
     )
     .setFooter({ text: `Page ${page + 1} of ${totalPages}` });
 }

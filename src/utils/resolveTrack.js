@@ -9,7 +9,7 @@ const {
 
 // How many YouTube searches run at once when resolving a big Spotify
 // playlist/album. Higher = faster, but more likely to hit rate limits.
-const SPOTIFY_SEARCH_CONCURRENCY = 5;
+const SPOTIFY_SEARCH_CONCURRENCY = 4;
 
 function detectSource(query) {
   if (/open\.spotify\.com\/(track|album|playlist)\//i.test(query)) return 'spotify';
