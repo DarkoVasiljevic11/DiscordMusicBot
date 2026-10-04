@@ -1,5 +1,8 @@
  Discord Music Bot
 
+
+Update>>playdl from iamtraction misbehaved with certain playlists, decided to use yt-dlp instead which can be found for windows, linux on its official github repo, note that playdl still works but must be updated reguraly and migth produce the same outcome with certain songs, playlists as it did for me
+
 A self-hosted Discord music bot built with Node.js and `discord.js` v14. Plays audio from **YouTube**, **Spotify**, and **SoundCloud** links or plain-text search, with a full queue system, pagination, shuffle, and repeat.
 
 Built for personal/single-server use — no dashboard, no premium tiers, just a bot you run yourself.
@@ -93,7 +96,7 @@ FFMPEG_PATH=
 
 `GUILD_ID` is optional: with it set, slash commands sync to that server instantly; without it, they sync globally, which can take up to an hour to propagate.
 
-### 5. Register slash commands
+ 5. Register slash commands
 
 ```bash
 npm run deploy
@@ -101,7 +104,7 @@ npm run deploy
 
 Re-run this any time a command is added or changed.
 
-### 6. Run the bot
+ 6. Run the bot
 
 ```bash
 npm start
@@ -109,7 +112,7 @@ npm start
 
 You should see `Logged in as <bot>#0000` and `SoundCloud client ID acquired` in the console.
 
-## Project structure
+Project structure
 
 ```
 src/
@@ -126,7 +129,7 @@ src/
 └── commands/                 # One file per slash command
 ```
 
-## Configuration knobs
+ Configuration knobs
 
 | Setting | Location | Default | Notes |
 |---|---|---|---|
@@ -135,7 +138,7 @@ src/
 | Auto-leave timeout | `src/queueManager.js` | `5 min` | How long the bot waits in an empty queue before disconnecting. |
 | Queue page size | `src/commands/queue.js` | `10` | Tracks shown per page in `/queue`. |
 
-## Troubleshooting
+Troubleshooting
 
 **Bot connects but no audio plays / `FFmpeg/avconv not found`**
 `ffmpeg-static`'s bundled binary can fail to download correctly on some networks (corporate proxies, antivirus interception). Either:
@@ -154,12 +157,12 @@ The automatic client ID fetch on startup failed (check the console output). This
 **Spotify API returns 403 for a playlist**
 The Spotify account you authorized via `spotify-auth.js` must own or collaborate on that playlist — Spotify doesn't allow reading arbitrary private playlists via the API.
 
-## Limitations
+ Limitations
 
 - In-memory queue — restarting the bot clears all active queues.
 - Single-process, single-instance — not designed to be sharded across multiple servers at scale.
 - Spotify playback is YouTube audio matched by title/artist, not the original Spotify master — occasional mismatches are possible for obscure tracks or unusual remixes.
 
-## License
+ License
 
 Personal project — use and modify freely.
