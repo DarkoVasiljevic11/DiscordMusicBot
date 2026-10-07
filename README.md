@@ -2,6 +2,7 @@
 
 
 Update>>playdl from iamtraction misbehaved with certain playlists, decided to use yt-dlp instead which can be found for windows, linux on its official github repo, note that playdl still works but must be updated reguraly and migth produce the same outcome with certain songs, playlists as it did for me
+Update fixes> added new command(/playlong) to be able to play long tracks without checking for lenght and ending the track early, fixed up queue manager to use ytdlp instead of @iamtraction/playdl, edited resolveTrack to handle longer tracks and have the regural play command work 
 
 A self-hosted Discord music bot built with Node.js and `discord.js` v14. Plays audio from **YouTube**, **Spotify**, and **SoundCloud** links or plain-text search, with a full queue system, pagination, shuffle, and repeat.
 
