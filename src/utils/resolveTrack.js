@@ -1,4 +1,3 @@
-
 const play = require('@iamtraction/play-dl');
 const ytSearch = require('yt-search');
 const path = require('path');
@@ -12,21 +11,19 @@ const {
 } = require('./spotify');
 
 // How many YouTube searches run at once when resolving a big Spotify
-// playlist/album. Higher = faster, but more likely to hit rate limits.
+// playlist/album.
 const SPOTIFY_SEARCH_CONCURRENCY = 4;
 
-// yt-dlp executable.
-// We keep it in the root of the Discord bot project.
-const YTDLP_PATH = path.join(
-  __dirname,
-  '../../yt-dlp.exe'
-);
+// yt-dlp executable is in the project root.
+const YTDLP_PATH = path.join(__dirname, '../../yt-dlp.exe');
+
+// ============================================================
+// SOURCE DETECTION
+// ============================================================
 
 function detectSource(query) {
   if (
-    /open\.spotify\.com\/(track|album|playlist)\//i.test(
-      query
-    )
+    /open\.spotify\.com\/(track|album|playlist)\//i.test(query)
   ) {
     return 'spotify';
   }
@@ -42,6 +39,59 @@ function detectSource(query) {
   }
 
   return 'search';
+}
+
+// ============================================================
+// RUN YT-DLP
+// ============================================================
+
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    const process = spawn(YTDLP_PATH, args, {
+      windowsHide: true,
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    process.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    process.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    process.on('error', (error) => {
+      if (error.code === 'ENOENT') {
+        reject(
+          new Error(
+            'yt-dlp.exe was not found. Put yt-dlp.exe in the root folder of your Discord bot.'
+          )
+        );
+      } else {
+        reject(error);
+      }
+    });
+
+    process.on('close', (code) => {
+      if (code !== 0) {
+        reject(
+          new Error(
+            `yt-dlp failed with exit code ${code}: ${
+              stderr.trim() || 'unknown error'
+            }`
+          )
+        );
+        return;
+      }
+
+      resolve({
+        stdout,
+        stderr,
+      });
+    });
+  });
 }
 
 // ============================================================
@@ -87,13 +137,63 @@ async function findYoutubeMatch(title, artists) {
 }
 
 // ============================================================
-// YT-DLP PLAYLIST EXTRACTION
+// YOUTUBE VIDEO INFO THROUGH YT-DLP
 // ============================================================
 
-function getYoutubePlaylistVideos(query) {
+async function getYoutubeVideoInfo(query) {
+  console.log(
+    `Reading YouTube video information with yt-dlp...`
+  );
+
+  const { stdout } = await runYtDlp([
+    '--no-playlist',
+    '--dump-single-json',
+    '--skip-download',
+    '--no-warnings',
+    query,
+  ]);
+
+  if (!stdout.trim()) {
+    throw new Error(
+      'yt-dlp returned no information for that YouTube video.'
+    );
+  }
+
+  try {
+    const data = JSON.parse(stdout);
+
+    if (!data || !data.id) {
+      throw new Error(
+        'yt-dlp returned invalid YouTube video information.'
+      );
+    }
+
+    return data;
+  } catch (error) {
+    console.error(
+      'Could not parse yt-dlp video output:',
+      error
+    );
+
+    console.error(
+      'yt-dlp output:',
+      stdout.substring(0, 2000)
+    );
+
+    throw new Error(
+      'yt-dlp returned invalid video data.'
+    );
+  }
+}
+
+// ============================================================
+// YOUTUBE PLAYLIST EXTRACTION
+// ============================================================
+
+async function getYoutubePlaylistVideos(query) {
   return new Promise((resolve, reject) => {
     console.log(
-      `Reading YouTube playlist with yt-dlp...`
+      'Reading YouTube playlist with yt-dlp...'
     );
 
     const args = [
@@ -134,10 +234,7 @@ function getYoutubePlaylistVideos(query) {
 
     process.on('close', (code) => {
       if (!stdout.trim()) {
-        console.error(
-          'yt-dlp stderr:',
-          stderr
-        );
+        console.error('yt-dlp stderr:', stderr);
 
         reject(
           new Error(
@@ -173,10 +270,9 @@ function getYoutubePlaylistVideos(query) {
           })
           .map((entry) => {
             const url =
-              entry.url &&
-              /^https?:\/\//i.test(entry.url)
-                ? entry.url
-                : `https://www.youtube.com/watch?v=${entry.id}`;
+              entry.webpage_url ||
+              entry.url ||
+              `https://www.youtube.com/watch?v=${entry.id}`;
 
             return {
               id: entry.id,
@@ -187,6 +283,8 @@ function getYoutubePlaylistVideos(query) {
               duration:
                 entry.duration_string ||
                 null,
+              durationInSec:
+                entry.duration || null,
             };
           });
 
@@ -217,21 +315,30 @@ function getYoutubePlaylistVideos(query) {
 // ============================================================
 
 /**
- * Resolves a query (a YouTube/Spotify/SoundCloud URL,
- * or plain search text) into one or more playable track objects.
+ * Resolves a query into playable track objects.
  *
- * @param {string} query
- * @param {string} requestedBy
- * @param {object} [options]
- * @param {(tracks: object[]) => void} [options.onBatch]
- * @param {(total: number) => void} [options.onStart]
- * @returns {Promise<object[]>}
+ * options:
+ *
+ * onBatch(tracks)
+ * onStart(total)
+ *
+ * longMode:
+ *   true when /playlong is being used.
+ *
+ * In longMode, YouTube tracks are marked with:
+ *
+ *   longMode: true
+ *
+ * The actual streaming is handled by queueManager.js.
  */
-
 async function resolveQuery(
   query,
   requestedBy,
-  { onBatch, onStart } = {}
+  {
+    onBatch,
+    onStart,
+    longMode = false,
+  } = {}
 ) {
   const source = detectSource(query);
 
@@ -244,6 +351,22 @@ async function resolveQuery(
       onBatch(tracks);
     }
   };
+
+  // ==========================================================
+  // LONG MODE
+  //
+  // /playlong is intentionally YouTube-only.
+  // ==========================================================
+
+  if (
+    longMode &&
+    source !== 'youtube' &&
+    source !== 'search'
+  ) {
+    throw new Error(
+      '/playlong currently supports YouTube videos, playlists, or YouTube searches only.'
+    );
+  }
 
   // ==========================================================
   // SPOTIFY
@@ -285,8 +408,6 @@ async function resolveQuery(
 
     const allTracks = [];
 
-    // Resolve Spotify tracks in small
-    // concurrent chunks.
     for (
       let i = 0;
       i < infos.length;
@@ -319,8 +440,7 @@ async function resolveQuery(
             return {
               title: `${info.title} - ${info.artists}`,
               url: match.url,
-              duration:
-                match.durationRaw,
+              duration: match.durationRaw,
               source: 'spotify',
               requestedBy,
             };
@@ -428,16 +548,6 @@ async function resolveQuery(
 
     // ========================================================
     // YOUTUBE PLAYLIST
-    //
-    // IMPORTANT:
-    // We DO NOT use play.playlist_info().
-    //
-    // play-dl is currently failing inside its playlist parser
-    // with:
-    //
-    // Cannot read properties of undefined (reading 'contents')
-    //
-    // Instead, yt-dlp gets the playlist entries.
     // ========================================================
 
     if (type === 'yt_playlist') {
@@ -488,6 +598,12 @@ async function resolveQuery(
               video.duration,
             source: 'youtube',
             requestedBy,
+
+            // This is the important part.
+            // Only /playlong sets longMode.
+            ...(longMode
+              ? { longMode: true }
+              : {}),
           }));
 
       if (tracks.length === 0) {
@@ -507,6 +623,65 @@ async function resolveQuery(
 
     // ========================================================
     // YOUTUBE SINGLE VIDEO
+    //
+    // Normal /play:
+    //   Uses play-dl metadata.
+    //
+    // /playlong:
+    //   Uses yt-dlp metadata.
+    // ========================================================
+
+    if (longMode) {
+      const details =
+        await getYoutubeVideoInfo(query);
+
+      const durationSeconds =
+        typeof details.duration === 'number'
+          ? details.duration
+          : null;
+
+      const durationString =
+        typeof details.duration_string === 'string'
+          ? details.duration_string
+          : null;
+
+      const track = {
+        title:
+          details.title ||
+          `YouTube video ${details.id}`,
+
+        // IMPORTANT:
+        // Keep the original YouTube URL.
+        // queueManager.js will ask yt-dlp for
+        // a fresh direct audio URL when playback starts.
+        url:
+          details.webpage_url ||
+          query,
+
+        duration:
+          durationString ||
+          (
+            durationSeconds !== null
+              ? formatDuration(durationSeconds)
+              : null
+          ),
+
+        source: 'youtube',
+        requestedBy,
+        longMode: true,
+      };
+
+      if (onStart) {
+        onStart(1);
+      }
+
+      emit([track]);
+
+      return [track];
+    }
+
+    // ========================================================
+    // NORMAL YOUTUBE SINGLE VIDEO
     // ========================================================
 
     let info;
@@ -575,6 +750,10 @@ async function resolveQuery(
     duration: match.durationRaw,
     source: 'youtube',
     requestedBy,
+
+    ...(longMode
+      ? { longMode: true }
+      : {}),
   };
 
   if (onStart) {
@@ -584,6 +763,29 @@ async function resolveQuery(
   emit([track]);
 
   return [track];
+}
+
+// ============================================================
+// FORMAT SECONDS AS H:MM:SS
+// ============================================================
+
+function formatDuration(seconds) {
+  seconds = Math.floor(seconds);
+
+  const hours =
+    Math.floor(seconds / 3600);
+
+  const minutes =
+    Math.floor((seconds % 3600) / 60);
+
+  const secs =
+    seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+
+  return `${minutes}:${String(secs).padStart(2, '0')}`;
 }
 
 module.exports = {

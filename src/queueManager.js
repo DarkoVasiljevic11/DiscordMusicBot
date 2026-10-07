@@ -5,327 +5,1207 @@ const {
   AudioPlayerStatus,
   VoiceConnectionStatus,
   VoiceConnectionDisconnectReason,
+  StreamType,
   entersState,
 } = require('@discordjs/voice');
+
 const play = require('@iamtraction/play-dl');
 const GuildQueue = require('./structures/Queue');
 
+const path = require('path');
+const { spawn } = require('child_process');
+
 const queues = new Map();
 
-// How many times to try resuming a track (via seek) after a mid-playback
-// stream error (e.g. YouTube's CDN dropping the connection on longer videos)
-// before giving up and moving on to the next song.
+// ============================================================
+// EXECUTABLES
+// ============================================================
+
+// queueManager.js is inside /src
+// yt-dlp.exe is in the project root.
+
+const YTDLP_PATH = path.join(
+  __dirname,
+  '../yt-dlp.exe'
+);
+
+// FFmpeg must be installed and available in PATH.
+//
+// You can also set:
+//   FFMPEG_PATH=C:\path\to\ffmpeg.exe
+//
+// if ffmpeg is not in PATH.
+
+const FFMPEG_PATH =
+  process.env.FFMPEG_PATH || 'ffmpeg';
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
 const MAX_STREAM_RETRIES = 3;
+
+const STREAM_START_TIMEOUT_MS = 20_000;
+
+const STALL_CHECK_INTERVAL_MS = 10_000;
+
+const STALLED_AFTER_CHECKS = 2;
+
+// ============================================================
+// QUEUE ACCESS
+// ============================================================
 
 function getQueue(guildId) {
   return queues.get(guildId);
 }
 
-// Track durations come from different sources in different shapes: a
-// formatted string like "3:45" (or "1:02:03") from YouTube, or a plain
-// number of seconds from SoundCloud. Normalize both to seconds.
+// ============================================================
+// DURATION HELPERS
+// ============================================================
+
 function durationToSeconds(duration) {
-  if (typeof duration === 'number') return duration;
-  if (typeof duration !== 'string') return null;
-  const parts = duration.split(':').map(Number);
-  if (parts.some(Number.isNaN)) return null;
-  return parts.reduce((total, part) => total * 60 + part, 0);
+  if (typeof duration === 'number') {
+    return duration;
+  }
+
+  if (typeof duration !== 'string') {
+    return null;
+  }
+
+  const parts =
+    duration.split(':').map(Number);
+
+  if (
+    parts.some(
+      Number.isNaN
+    )
+  ) {
+    return null;
+  }
+
+  return parts.reduce(
+    (total, part) =>
+      total * 60 + part,
+    0
+  );
 }
 
-async function createQueue(guildId, { textChannel, voiceChannel }) {
-  const connection = joinVoiceChannel({
-    channelId: voiceChannel.id,
-    guildId,
-    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-  });
+// ============================================================
+// CREATE QUEUE
+// ============================================================
+
+async function createQueue(
+  guildId,
+  { textChannel, voiceChannel }
+) {
+  const connection =
+    joinVoiceChannel({
+      channelId:
+        voiceChannel.id,
+
+      guildId,
+
+      adapterCreator:
+        voiceChannel.guild
+          .voiceAdapterCreator,
+    });
 
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    await entersState(
+      connection,
+      VoiceConnectionStatus.Ready,
+      20_000
+    );
   } catch (err) {
     connection.destroy();
+
     throw new Error(
       "Couldn't establish a voice connection (timed out waiting to become ready). This is usually caused by a firewall, VPN, or network blocking Discord's voice (UDP) traffic."
     );
   }
 
-  const player = createAudioPlayer();
+  const player =
+    createAudioPlayer();
+
   connection.subscribe(player);
 
-  const queue = new GuildQueue({ guildId, textChannel, voiceChannel, connection, player });
-  queues.set(guildId, queue);
+  const queue =
+    new GuildQueue({
+      guildId,
+      textChannel,
+      voiceChannel,
+      connection,
+      player,
+    });
 
-  player.on(AudioPlayerStatus.Idle, () => {
-    // A retry-in-progress (see playCurrentTrack's error handling) causes its
-    // own Idle transition as a side effect of restarting playback — that one
-    // should NOT advance the queue, it's handled entirely by the retry logic.
-    if (queue.retryPending) {
-      queue.retryPending = false;
-      return;
-    }
+  queues.set(
+    guildId,
+    queue
+  );
 
-    const wasSkipped = queue.skipFlag;
-    queue.skipFlag = false;
+  // ==========================================================
+  // AUDIO PLAYER IDLE
+  // ==========================================================
 
-    if (queue.current && !wasSkipped) {
-      const expectedSec = durationToSeconds(queue.current.duration);
-      const actualSec = queue.current.startedAt ? (Date.now() - queue.current.startedAt) / 1000 : null;
-
-      // The stream sometimes ends cleanly — no 'error' event at all — well
-      // before the track is actually done. This has been confirmed to happen
-      // alongside the ERR_STREAM_PREMATURE_CLOSE cases, just without an
-      // error being thrown, so it needs to go through the same retry-with-
-      // seek logic rather than being silently treated as a normal finish.
-      if (expectedSec && actualSec && expectedSec > 15 && actualSec < expectedSec * 0.9) {
-        handleStreamFailure(guildId, new Error('Track ended early with no error event — retrying'));
+  player.on(
+    AudioPlayerStatus.Idle,
+    () => {
+      if (queue.retryPending) {
+        queue.retryPending = false;
         return;
       }
+
+      const wasSkipped =
+        queue.skipFlag;
+
+      queue.skipFlag = false;
+
+      if (
+        queue.current &&
+        !wasSkipped
+      ) {
+        const expectedSec =
+          durationToSeconds(
+            queue.current.duration
+          );
+
+        const actualSec =
+          queue.current.startedAt
+            ? (
+                Date.now() -
+                queue.current.startedAt
+              ) / 1000
+            : null;
+
+        // A stream ended significantly before
+        // its expected duration.
+        //
+        // This is NOT a duration limit.
+        // It only detects premature stream termination.
+
+        if (
+          expectedSec &&
+          actualSec &&
+          expectedSec > 15 &&
+          actualSec <
+            expectedSec * 0.9
+        ) {
+          handleStreamFailure(
+            guildId,
+            new Error(
+              'Track ended early with no error event — retrying'
+            )
+          );
+
+          return;
+        }
+      }
+
+      if (
+        queue.loop &&
+        queue.current &&
+        !wasSkipped
+      ) {
+        queue.songs.unshift(
+          queue.current
+        );
+      }
+
+      cleanupTrackProcesses(
+        queue.current
+      );
+
+      queue.current = null;
+
+      playNext(guildId);
     }
+  );
 
-    if (queue.loop && queue.current && !wasSkipped) {
-      // Put the just-finished track back at the front so playNext replays it.
-      queue.songs.unshift(queue.current);
+  // ==========================================================
+  // AUDIO PLAYER ERROR
+  // ==========================================================
+
+  player.on(
+    'error',
+    (error) => {
+      handleStreamFailure(
+        guildId,
+        error
+      );
     }
+  );
 
-    queue.current = null;
-    playNext(guildId);
-  });
+  // ==========================================================
+  // VOICE CONNECTION RECOVERY
+  // ==========================================================
 
-  player.on('error', (error) => {
-    handleStreamFailure(guildId, error);
-  });
+  connection.on(
+    VoiceConnectionStatus.Disconnected,
+    async (
+      _oldState,
+      newState
+    ) => {
+      if (
+        newState.reason ===
+          VoiceConnectionDisconnectReason.WebSocketClose &&
+        newState.closeCode === 4014
+      ) {
+        try {
+          await entersState(
+            connection,
+            VoiceConnectionStatus.Connecting,
+            5_000
+          );
+        } catch {
+          queue.textChannel
+            ?.send(
+              '⚠️ Lost the voice connection and could not recover. Leaving the channel.'
+            )
+            .catch(() => {});
 
-  connection.on(VoiceConnectionStatus.Disconnected, async (_oldState, newState) => {
-    if (newState.reason === VoiceConnectionDisconnectReason.WebSocketClose && newState.closeCode === 4014) {
-      // Code 4014 covers two very different cases: the bot was moved to another
-      // channel (recoverable, connection often heals itself), or the bot was
-      // kicked/disconnected/lost channel permissions (not recoverable). Give it
-      // a few seconds to see which one this is before giving up.
-      try {
-        await entersState(connection, VoiceConnectionStatus.Connecting, 5_000);
-        // Was moved channel — connection is recovering on its own.
-      } catch {
-        queue.textChannel?.send('⚠️ Lost the voice connection and could not recover. Leaving the channel.').catch(() => {});
+          destroyQueue(guildId);
+        }
+      } else if (
+        connection.rejoinAttempts < 5
+      ) {
+        await new Promise(
+          (resolve) =>
+            setTimeout(
+              resolve,
+              (
+                connection.rejoinAttempts +
+                1
+              ) * 5_000
+            )
+        );
+
+        try {
+          connection.rejoin();
+        } catch {
+          queue.textChannel
+            ?.send(
+              '⚠️ Lost the voice connection and could not recover. Leaving the channel.'
+            )
+            .catch(() => {});
+
+          destroyQueue(guildId);
+        }
+      } else {
+        queue.textChannel
+          ?.send(
+            '⚠️ Lost the voice connection after several retries. Leaving the channel.'
+          )
+          .catch(() => {});
+
         destroyQueue(guildId);
       }
-    } else if (connection.rejoinAttempts < 5) {
-      // A recoverable disconnect (brief network blip, Discord rebalancing the
-      // voice server, etc.) — back off a little longer each time and retry.
-      await new Promise((resolve) => setTimeout(resolve, (connection.rejoinAttempts + 1) * 5_000));
-      try {
-        connection.rejoin();
-      } catch {
-        queue.textChannel?.send('⚠️ Lost the voice connection and could not recover. Leaving the channel.').catch(() => {});
-        destroyQueue(guildId);
-      }
-    } else {
-      // Repeated failures — stop trying and clean up.
-      queue.textChannel?.send('⚠️ Lost the voice connection after several retries. Leaving the channel.').catch(() => {});
-      destroyQueue(guildId);
     }
-  });
+  );
 
   return queue;
 }
 
-/**
- * Handles a mid-playback stream failure (network drop, premature close,
- * etc.) for whatever track is currently playing in this guild. Retries by
- * resuming from the elapsed position (via play-dl's `seek` option) up to
- * MAX_STREAM_RETRIES times before giving up and skipping to the next track.
- */
-function handleStreamFailure(guildId, error) {
-  const queue = queues.get(guildId);
-  if (!queue || !queue.current) return;
-  if (queue.retryPending) return; // a retry for this exact failure is already in flight
+// ============================================================
+// CLEANUP STREAM PROCESSES
+// ============================================================
 
-  const track = queue.current;
-  const elapsedThisAttempt = track.attemptStartedAt ? (Date.now() - track.attemptStartedAt) / 1000 : 0;
-  const totalPlayed = track.seekOffset + elapsedThisAttempt;
-  const expectedSec = durationToSeconds(track.duration);
-
-  // A stream 'error' firing right as a track reaches its natural end is a
-  // known benign artifact (Node's pipeline can flag the teardown as a
-  // "premature" close even though every byte was already delivered) — treat
-  // that as a normal finish rather than a failure worth retrying/announcing.
-  if (expectedSec && totalPlayed >= expectedSec - 3) {
-    queue.current = null;
-    playNext(guildId);
+function cleanupTrackProcesses(track) {
+  if (!track) {
     return;
   }
 
-  console.error(`Playback error on "${track.title}" (attempt ${track.streamAttempt + 1}):`, error);
+  if (track.ffmpegProcess) {
+    try {
+      track.ffmpegProcess.kill();
+    } catch {}
 
-  const resumeFrom = Math.max(0, totalPlayed - 1); // rewind 1s to avoid a tiny gap
+    track.ffmpegProcess = null;
+  }
 
-  if (track.streamAttempt < MAX_STREAM_RETRIES) {
-    track.streamAttempt += 1;
-    track.seekOffset = resumeFrom;
-    queue.retryPending = true; // suppress the Idle handler's normal advance-to-next-song logic
-    if (track.streamAttempt === 1) {
-      queue.textChannel?.send(`⚠️ Connection hiccup on **${track.title}**, resuming...`).catch(() => {});
+  if (track.ytDlpProcess) {
+    try {
+      track.ytDlpProcess.kill();
+    } catch {}
+
+    track.ytDlpProcess = null;
+  }
+
+  track.resource = null;
+}
+
+// ============================================================
+// GET DIRECT AUDIO URL WITH YT-DLP
+// ============================================================
+
+function getYtDlpAudioUrl(
+  url,
+  track
+) {
+  return new Promise(
+    (resolve, reject) => {
+      const args = [
+        '--no-playlist',
+        '--no-warnings',
+        '--no-progress',
+        '-f',
+        'bestaudio/best',
+        '-g',
+        url,
+      ];
+
+      console.log(
+        `Getting fresh yt-dlp audio URL for "${url}"`
+      );
+
+      const process =
+        spawn(
+          YTDLP_PATH,
+          args,
+          {
+            windowsHide: true,
+            stdio: [
+              'ignore',
+              'pipe',
+              'pipe',
+            ],
+          }
+        );
+
+      if (track) {
+        track.ytDlpProcess =
+          process;
+      }
+
+      let stdout = '';
+      let stderr = '';
+
+      process.stdout.on(
+        'data',
+        (data) => {
+          stdout +=
+            data.toString();
+        }
+      );
+
+      process.stderr.on(
+        'data',
+        (data) => {
+          stderr +=
+            data.toString();
+        }
+      );
+
+      process.on(
+        'error',
+        (error) => {
+          if (
+            track &&
+            track.ytDlpProcess ===
+              process
+          ) {
+            track.ytDlpProcess =
+              null;
+          }
+
+          if (
+            error.code ===
+            'ENOENT'
+          ) {
+            reject(
+              new Error(
+                'yt-dlp.exe was not found in the bot root directory.'
+              )
+            );
+          } else {
+            reject(error);
+          }
+        }
+      );
+
+      process.on(
+        'close',
+        (code) => {
+          if (
+            track &&
+            track.ytDlpProcess ===
+              process
+          ) {
+            track.ytDlpProcess =
+              null;
+          }
+
+          if (
+            code !== 0
+          ) {
+            reject(
+              new Error(
+                `yt-dlp failed while getting the audio URL (exit code ${code}): ${
+                  stderr.trim() ||
+                  'unknown error'
+                }`
+              )
+            );
+
+            return;
+          }
+
+          const directUrl =
+            stdout
+              .trim()
+              .split(/\r?\n/)
+              .filter(Boolean)
+              .pop();
+
+          if (!directUrl) {
+            reject(
+              new Error(
+                'yt-dlp returned no audio URL.'
+              )
+            );
+
+            return;
+          }
+
+          resolve(
+            directUrl
+          );
+        }
+      );
     }
-    playCurrentTrack(guildId);
+  );
+}
+
+// ============================================================
+// START FFMPEG FOR LONG VIDEO
+// ============================================================
+
+async function startLongVideoStream(
+  track
+) {
+  // Get a fresh YouTube CDN URL.
+  //
+  // This is intentionally done every time the
+  // long-video stream starts/restarts because
+  // CDN URLs can expire.
+
+  const directUrl =
+    await getYtDlpAudioUrl(
+      track.url,
+      track
+    );
+
+  const seek =
+    Math.max(
+      0,
+      Math.floor(
+        track.seekOffset || 0
+      )
+    );
+
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'warning',
+
+    // Reconnect support for HTTP streams.
+    '-reconnect',
+    '1',
+    '-reconnect_streamed',
+    '1',
+    '-reconnect_delay_max',
+    '10',
+  ];
+
+  // Resume approximately where the
+  // previous attempt stopped.
+
+  if (seek > 0) {
+    args.push(
+      '-ss',
+      String(seek)
+    );
+  }
+
+  args.push(
+    '-i',
+    directUrl,
+
+    // Audio only.
+    '-vn',
+
+    // Discord-compatible raw PCM.
+    '-f',
+    's16le',
+
+    '-ar',
+    '48000',
+
+    '-ac',
+    '2',
+
+    'pipe:1'
+  );
+
+  console.log(
+    `Starting FFmpeg long-video stream for "${track.title}"${
+      seek > 0
+        ? ` from ${seek}s`
+        : ''
+    }`
+  );
+
+  const ffmpeg =
+    spawn(
+      FFMPEG_PATH,
+      args,
+      {
+        windowsHide: true,
+        stdio: [
+          'ignore',
+          'pipe',
+          'pipe',
+        ],
+      }
+    );
+
+  track.ffmpegProcess =
+    ffmpeg;
+
+  let stderr = '';
+
+  ffmpeg.stderr.on(
+    'data',
+    (data) => {
+      stderr +=
+        data.toString();
+    }
+  );
+
+  ffmpeg.on(
+    'error',
+    (error) => {
+      if (
+        track.ffmpegProcess ===
+          ffmpeg
+      ) {
+        track.ffmpegProcess =
+          null;
+      }
+
+      console.error(
+        'FFmpeg error:',
+        error
+      );
+    }
+  );
+
+  ffmpeg.on(
+    'close',
+    (code) => {
+      if (
+        track.ffmpegProcess ===
+          ffmpeg
+      ) {
+        track.ffmpegProcess =
+          null;
+      }
+
+      if (
+        code !== 0 &&
+        code !== null &&
+        stderr.trim()
+      ) {
+        console.error(
+          `FFmpeg exited with code ${code}:`,
+          stderr.trim()
+        );
+      }
+    }
+  );
+
+  return {
+    stream: ffmpeg.stdout,
+    process: ffmpeg,
+  };
+}
+
+// ============================================================
+// HANDLE STREAM FAILURE
+// ============================================================
+
+function handleStreamFailure(
+  guildId,
+  error
+) {
+  const queue =
+    queues.get(guildId);
+
+  if (
+    !queue ||
+    !queue.current
+  ) {
+    return;
+  }
+
+  if (
+    queue.retryPending
+  ) {
+    return;
+  }
+
+  const track =
+    queue.current;
+
+  const elapsedThisAttempt =
+    track.attemptStartedAt
+      ? (
+          Date.now() -
+          track.attemptStartedAt
+        ) / 1000
+      : 0;
+
+  const totalPlayed =
+    (
+      track.seekOffset || 0
+    ) +
+    elapsedThisAttempt;
+
+  const expectedSec =
+    durationToSeconds(
+      track.duration
+    );
+
+  // If we're effectively at the end,
+  // treat it as a normal completion.
+
+  if (
+    expectedSec &&
+    totalPlayed >=
+      expectedSec - 3
+  ) {
+    cleanupTrackProcesses(
+      track
+    );
+
+    queue.current = null;
+
+    playNext(guildId);
+
+    return;
+  }
+
+  console.error(
+    `Playback error on "${track.title}" (attempt ${
+      (track.streamAttempt || 0) + 1
+    }):`,
+    error
+  );
+
+  const resumeFrom =
+    Math.max(
+      0,
+      totalPlayed - 1
+    );
+
+  if (
+    track.streamAttempt <
+    MAX_STREAM_RETRIES
+  ) {
+    track.streamAttempt += 1;
+
+    // For both normal and long mode,
+    // remember approximately where we were.
+
+    track.seekOffset =
+      resumeFrom;
+
+    queue.retryPending =
+      true;
+
+    cleanupTrackProcesses(
+      track
+    );
+
+    if (
+      track.streamAttempt ===
+      1
+    ) {
+      queue.textChannel
+        ?.send(
+          `⚠️ Connection hiccup on **${track.title}**, resuming...`
+        )
+        .catch(() => {});
+    }
+
+    playCurrentTrack(
+      guildId
+    );
   } else {
     queue.textChannel
-      ?.send(`⚠️ Couldn't recover **${track.title}** after ${MAX_STREAM_RETRIES} attempts, skipping.`)
+      ?.send(
+        `⚠️ Couldn't recover **${track.title}** after ${MAX_STREAM_RETRIES} attempts, skipping.`
+      )
       .catch(() => {});
+
+    cleanupTrackProcesses(
+      track
+    );
+
     queue.current = null;
+
     playNext(guildId);
   }
 }
 
-/**
- * Starts (or resumes, via track.seekOffset) streaming queue.current.
- */
-async function playCurrentTrack(guildId) {
-  const queue = queues.get(guildId);
-  if (!queue || !queue.current) return;
+// ============================================================
+// PLAY CURRENT TRACK
+// ============================================================
 
-  const track = queue.current;
+async function playCurrentTrack(
+  guildId
+) {
+  const queue =
+    queues.get(guildId);
+
+  if (
+    !queue ||
+    !queue.current
+  ) {
+    return;
+  }
+
+  const track =
+    queue.current;
 
   try {
-    // NOTE: previously forced quality: 2 (highest bitrate) here, on the theory
-    // that lower-quality formats under-report their length. That wasn't
-    // actually the cause of tracks cutting short (a mid-download CDN drop
-    // was — see handleStreamFailure), and forcing quality: 2 turned out to
-    // make play.stream() hang indefinitely for at least one video instead of
-    // resolving or rejecting. Left at the default (play-dl picks a sensible
-    // format itself) and wrapped in a timeout so a hang can never go unnoticed.
-    const streamOptions = {};
-    if (track.seekOffset > 0) streamOptions.seek = Math.floor(track.seekOffset);
+    let stream;
+    let inputType;
 
-    const streamInfo = await Promise.race([
-      play.stream(track.url, streamOptions),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Timed out starting stream (play.stream took over 15s)')), 15_000)
-      ),
-    ]);
+    // ========================================================
+    // LONG MODE
+    //
+    // yt-dlp -> direct CDN URL
+    // FFmpeg -> Discord-compatible PCM
+    // ========================================================
 
-    // Confirmed by testing: a mid-download connection drop (e.g. YouTube's
-    // CDN closing the connection on longer videos) surfaces here, on the raw
-    // stream, as an 'error' event — NOT as the AudioPlayer's own 'error'
-    // event. This is the listener that actually catches it.
-    streamInfo.stream.on('error', (err) => {
-      handleStreamFailure(guildId, err);
-    });
+    if (
+      track.longMode
+    ) {
+      const result =
+        await Promise.race([
+          startLongVideoStream(
+            track
+          ),
 
-    const resource = createAudioResource(streamInfo.stream, {
-      inputType: streamInfo.type,
-      inlineVolume: true,
-    });
-    resource.volume?.setVolume(queue.volume);
-    track.resource = resource;
+          new Promise(
+            (_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      'Timed out starting yt-dlp/FFmpeg stream.'
+                    )
+                  ),
+                STREAM_START_TIMEOUT_MS
+              )
+          ),
+        ]);
 
-    queue.player.play(resource);
-    track.attemptStartedAt = Date.now();
-    if (track.streamAttempt === 0) {
-      track.startedAt = Date.now(); // only for the "did this end early" diagnostic
-      queue.textChannel?.send(`🎶 Now playing: **${track.title}**`).catch(() => {});
+      stream =
+        result.stream;
+
+      inputType =
+        StreamType.Raw;
+
+      stream.on(
+        'error',
+        (err) => {
+          handleStreamFailure(
+            guildId,
+            err
+          );
+        }
+      );
     }
 
-    startStallWatchdog(guildId, track, resource);
+    // ========================================================
+    // NORMAL MODE
+    //
+    // Existing play-dl behavior.
+    // ========================================================
+
+    else {
+      const streamOptions =
+        {};
+
+      if (
+        track.seekOffset >
+        0
+      ) {
+        streamOptions.seek =
+          Math.floor(
+            track.seekOffset
+          );
+      }
+
+      const streamInfo =
+        await Promise.race([
+          play.stream(
+            track.url,
+            streamOptions
+          ),
+
+          new Promise(
+            (_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      'Timed out starting stream (play.stream took over 20s)'
+                    )
+                  ),
+                STREAM_START_TIMEOUT_MS
+              )
+          ),
+        ]);
+
+      stream =
+        streamInfo.stream;
+
+      inputType =
+        streamInfo.type;
+
+      stream.on(
+        'error',
+        (err) => {
+          handleStreamFailure(
+            guildId,
+            err
+          );
+        }
+      );
+    }
+
+    // ========================================================
+    // CREATE DISCORD AUDIO RESOURCE
+    // ========================================================
+
+    const resource =
+      createAudioResource(
+        stream,
+        {
+          inputType,
+          inlineVolume: true,
+        }
+      );
+
+    resource.volume?.setVolume(
+      queue.volume
+    );
+
+    track.resource =
+      resource;
+
+    queue.player.play(
+      resource
+    );
+
+    track.attemptStartedAt =
+      Date.now();
+
+    if (
+      track.streamAttempt ===
+      0
+    ) {
+      track.startedAt =
+        Date.now();
+
+      queue.textChannel
+        ?.send(
+          `🎶 Now playing: **${track.title}**`
+        )
+        .catch(() => {});
+    }
+
+    startStallWatchdog(
+      guildId,
+      track,
+      resource
+    );
   } catch (err) {
-    console.error('Error starting stream:', err);
-    queue.textChannel?.send(`⚠️ Couldn't play **${track.title}**, skipping.`).catch(() => {});
+    console.error(
+      'Error starting stream:',
+      err
+    );
+
+    cleanupTrackProcesses(
+      track
+    );
+
+    queue.textChannel
+      ?.send(
+        `⚠️ Couldn't play **${track.title}**, skipping.`
+      )
+      .catch(() => {});
+
     queue.current = null;
+
     playNext(guildId);
   }
 }
 
-/**
- * Periodically checks that actual audio playback is still making progress.
- * A silent stall (no more data arrives, but also no 'error' and no natural
- * end) produces neither an error nor an Idle transition, so without this the
- * queue can get stuck on one track forever — blocking everything queued
- * after it — with nothing to indicate why. Long videos (an hour+) seem
- * especially prone to this on YouTube's end.
- */
-function startStallWatchdog(guildId, track, resource) {
-  const queue = queues.get(guildId);
-  if (!queue) return;
+// ============================================================
+// STALL WATCHDOG
+// ============================================================
 
-  if (queue.stallCheckInterval) clearInterval(queue.stallCheckInterval);
+function startStallWatchdog(
+  guildId,
+  track,
+  resource
+) {
+  const queue =
+    queues.get(guildId);
 
-  let lastPlaybackDuration = -1;
-  let stalledChecks = 0;
-  const CHECK_INTERVAL_MS = 10_000;
-  const STALLED_AFTER_CHECKS = 2; // ~20s with zero progress
-
-  queue.stallCheckInterval = setInterval(() => {
-    // Track already moved on (finished, skipped, retried, queue destroyed) —
-    // stop watching this one.
-    if (!queue.current || queue.current !== track) {
-      clearInterval(queue.stallCheckInterval);
-      return;
-    }
-    // Don't flag an intentional /pause as a stall.
-    if (queue.player.state.status === AudioPlayerStatus.Paused) {
-      stalledChecks = 0;
-      return;
-    }
-
-    const currentDuration = resource.playbackDuration;
-    if (currentDuration === lastPlaybackDuration) {
-      stalledChecks += 1;
-    } else {
-      stalledChecks = 0;
-      lastPlaybackDuration = currentDuration;
-    }
-
-    if (stalledChecks >= STALLED_AFTER_CHECKS) {
-      clearInterval(queue.stallCheckInterval);
-      console.warn(`Watchdog: "${track.title}" appears stalled (no playback progress for ~20s).`);
-      handleStreamFailure(guildId, new Error('Playback stalled — no audio progress detected'));
-    }
-  }, CHECK_INTERVAL_MS);
-}
-
-async function playNext(guildId) {
-  const queue = queues.get(guildId);
-  if (!queue) return;
-
-  if (queue.leaveTimeout) {
-    clearTimeout(queue.leaveTimeout);
-    queue.leaveTimeout = null;
-  }
-
-  if (queue.songs.length === 0) {
-    queue.playing = false;
-    // Auto-leave after 5 minutes of inactivity
-    queue.leaveTimeout = setTimeout(() => destroyQueue(guildId), 5 * 60 * 1000);
+  if (!queue) {
     return;
   }
 
-  const nextSong = queue.songs.shift();
+  if (
+    queue.stallCheckInterval
+  ) {
+    clearInterval(
+      queue.stallCheckInterval
+    );
+  }
 
-  if (!nextSong || !nextSong.url) {
-    console.warn('Skipping a queued track with no playable URL:', nextSong);
-    queue.textChannel?.send(`⚠️ Skipped **${nextSong?.title || 'a track'}** — no playable source found.`).catch(() => {});
+  let lastPlaybackDuration =
+    -1;
+
+  let stalledChecks =
+    0;
+
+  queue.stallCheckInterval =
+    setInterval(
+      () => {
+        if (
+          !queue.current ||
+          queue.current !==
+            track
+        ) {
+          clearInterval(
+            queue.stallCheckInterval
+          );
+
+          return;
+        }
+
+        if (
+          queue.player.state
+            .status ===
+          AudioPlayerStatus.Paused
+        ) {
+          stalledChecks = 0;
+          return;
+        }
+
+        const currentDuration =
+          resource.playbackDuration;
+
+        if (
+          currentDuration ===
+          lastPlaybackDuration
+        ) {
+          stalledChecks += 1;
+        } else {
+          stalledChecks = 0;
+          lastPlaybackDuration =
+            currentDuration;
+        }
+
+        if (
+          stalledChecks >=
+          STALLED_AFTER_CHECKS
+        ) {
+          clearInterval(
+            queue.stallCheckInterval
+          );
+
+          console.warn(
+            `Watchdog: "${track.title}" appears stalled (no playback progress for ~20s).`
+          );
+
+          handleStreamFailure(
+            guildId,
+            new Error(
+              'Playback stalled — no audio progress detected'
+            )
+          );
+        }
+      },
+      STALL_CHECK_INTERVAL_MS
+    );
+}
+
+// ============================================================
+// PLAY NEXT
+// ============================================================
+
+async function playNext(
+  guildId
+) {
+  const queue =
+    queues.get(guildId);
+
+  if (!queue) {
+    return;
+  }
+
+  if (
+    queue.leaveTimeout
+  ) {
+    clearTimeout(
+      queue.leaveTimeout
+    );
+
+    queue.leaveTimeout =
+      null;
+  }
+
+  if (
+    queue.songs.length ===
+    0
+  ) {
+    queue.playing =
+      false;
+
+    queue.leaveTimeout =
+      setTimeout(
+        () =>
+          destroyQueue(
+            guildId
+          ),
+        5 * 60 * 1000
+      );
+
+    return;
+  }
+
+  const nextSong =
+    queue.songs.shift();
+
+  if (
+    !nextSong ||
+    !nextSong.url
+  ) {
+    console.warn(
+      'Skipping a queued track with no playable URL:',
+      nextSong
+    );
+
+    queue.textChannel
+      ?.send(
+        `⚠️ Skipped **${
+          nextSong?.title ||
+          'a track'
+        }** — no playable source found.`
+      )
+      .catch(() => {});
+
     playNext(guildId);
+
     return;
   }
 
-  nextSong.streamAttempt = 0;
-  nextSong.seekOffset = 0;
-  queue.current = nextSong;
-  queue.playing = true;
+  nextSong.streamAttempt =
+    0;
 
-  await playCurrentTrack(guildId);
+  nextSong.seekOffset =
+    0;
+
+  nextSong.attemptStartedAt =
+    null;
+
+  nextSong.startedAt =
+    null;
+
+  nextSong.resource =
+    null;
+
+  nextSong.ffmpegProcess =
+    null;
+
+  nextSong.ytDlpProcess =
+    null;
+
+  queue.current =
+    nextSong;
+
+  queue.playing =
+    true;
+
+  await playCurrentTrack(
+    guildId
+  );
 }
 
-function destroyQueue(guildId) {
-  const queue = queues.get(guildId);
-  if (!queue) return;
+// ============================================================
+// DESTROY QUEUE
+// ============================================================
+
+function destroyQueue(
+  guildId
+) {
+  const queue =
+    queues.get(guildId);
+
+  if (!queue) {
+    return;
+  }
+
   queue.songs = [];
-  queue.current = null;
-  if (queue.stallCheckInterval) clearInterval(queue.stallCheckInterval);
+
+  cleanupTrackProcesses(
+    queue.current
+  );
+
+  queue.current =
+    null;
+
+  if (
+    queue.stallCheckInterval
+  ) {
+    clearInterval(
+      queue.stallCheckInterval
+    );
+
+    queue.stallCheckInterval =
+      null;
+  }
+
   try {
-    queue.player.stop(true);
+    queue.player.stop(
+      true
+    );
   } catch {}
+
   try {
     queue.connection.destroy();
   } catch {}
-  queues.delete(guildId);
+
+  queues.delete(
+    guildId
+  );
 }
 
-module.exports = { queues, getQueue, createQueue, playNext, destroyQueue, durationToSeconds };
+// ============================================================
+// EXPORTS
+// ============================================================
+
+module.exports = {
+  queues,
+  getQueue,
+  createQueue,
+  playNext,
+  destroyQueue,
+  durationToSeconds,
+};
