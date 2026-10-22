@@ -1,5 +1,5 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { getQueue } = require('../queueManager');
+const { getQueue, skipCurrent } = require('../queueManager');
 
 module.exports = {
   data: new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
@@ -8,9 +8,16 @@ module.exports = {
     if (!queue || !queue.current) {
       return interaction.reply({ content: 'Nothing is playing.', flags: MessageFlags.Ephemeral });
     }
-    const skipped = queue.current.title;
-    queue.skipFlag = true;
-    queue.player.stop(); // triggers Idle -> queueManager plays the next song automatically
-    await interaction.reply(`⏭️ Skipped **${skipped}**.`);
+
+    const track = queue.current;
+
+    // Reply BEFORE skipping. Skipping starts the next track immediately,
+    // which can launch yt-dlp.exe; on Windows (especially with antivirus
+    // scanning the exe) that can stall the bot for several seconds, and
+    // Discord shows "The application did not respond" if there's no reply
+    // within 3 seconds.
+    await interaction.reply(`⏭️ Skipped **${track.title}**.`);
+
+    skipCurrent(interaction.guildId, track);
   },
 };

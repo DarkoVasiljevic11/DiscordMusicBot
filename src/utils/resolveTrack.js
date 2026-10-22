@@ -42,6 +42,19 @@ function detectSource(query) {
 }
 
 // ============================================================
+// SOUNDCLOUD TRACK URL
+//
+// play-dl's SoundCloud `url` is SoundCloud's internal API address
+// (https://api.soundcloud.com/tracks/soundcloud%3Atracks%3A...), which
+// SoundCloud's own resolver answers with a 404. The public link is in
+// `permalink`, and that's the one that can be resolved and streamed.
+// ============================================================
+
+function soundcloudTrackUrl(track) {
+  return track.permalink || track.url || null;
+}
+
+// ============================================================
 // LOCAL YOUTUBE PLAYLIST URL CHECK
 //
 // Used only if play-dl's own validator throws.
@@ -517,11 +530,11 @@ async function resolveQuery(
           .filter(
             (t) =>
               t &&
-              t.url
+              soundcloudTrackUrl(t)
           )
           .map((t) => ({
             title: t.name,
-            url: t.url,
+            url: soundcloudTrackUrl(t),
             duration:
               t.durationInSec,
             source: 'soundcloud',
@@ -538,7 +551,7 @@ async function resolveQuery(
     }
 
     // SoundCloud single track
-    if (!info.url) {
+    if (!soundcloudTrackUrl(info)) {
       throw new Error(
         'That SoundCloud track is not playable (no stream URL returned).'
       );
@@ -546,7 +559,7 @@ async function resolveQuery(
 
     const track = {
       title: info.name,
-      url: info.url,
+      url: soundcloudTrackUrl(info),
       duration: info.durationInSec,
       source: 'soundcloud',
       requestedBy,

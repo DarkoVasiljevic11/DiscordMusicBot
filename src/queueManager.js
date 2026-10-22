@@ -77,6 +77,16 @@ function isYoutubeTrack(track) {
   );
 }
 
+// yt-dlp also understands SoundCloud links, so SoundCloud tracks can use it
+// as a one-off fallback too (without the "skip play-dl for a while" rule,
+// which is about YouTube specifically).
+function canFallBackToYtDlp(track) {
+  return (
+    isYoutubeTrack(track) ||
+    track.source === 'soundcloud'
+  );
+}
+
 function shouldUseYtDlp(track) {
   if (track.longMode || track.ytDlpFallback) {
     return true;
@@ -269,6 +279,16 @@ async function createQueue(
   player.on(
     'error',
     (error) => {
+      // An error from a resource that is no longer the current track's
+      // (e.g. the old track's teardown right after a skip) isn't a failure
+      // of whatever is playing now.
+      if (
+        error.resource &&
+        error.resource !== queue.current?.resource
+      ) {
+        return;
+      }
+
       handleStreamFailure(
         guildId,
         error
@@ -869,8 +889,7 @@ async function playCurrentTrack(guildId) {
       try {
         started = await startWithPlayDl();
       } catch (playDlError) {
-        // Only YouTube tracks have a fallback.
-        if (!isYoutubeTrack(track)) {
+        if (!canFallBackToYtDlp(track)) {
           throw playDlError;
         }
 
@@ -884,16 +903,42 @@ async function playCurrentTrack(guildId) {
 
         started = await startWithYtDlp();
 
-        // yt-dlp worked where play-dl didn't, so play-dl is the broken
-        // part: skip it for a while.
-        preferYtDlpUntil =
-          Date.now() + YT_DLP_PREFERRED_FOR_MS;
+        // yt-dlp worked where play-dl didn't, so for YouTube play-dl is
+        // the broken part: skip it for a while.
+        if (isYoutubeTrack(track)) {
+          preferYtDlpUntil =
+            Date.now() + YT_DLP_PREFERRED_FOR_MS;
+        }
       }
     }
 
     const { stream, inputType } = started;
 
+    // The track was skipped/cleared while its stream was still starting up:
+    // throw the new stream away instead of playing a track nobody wants.
+    if (queue.current !== track) {
+      cleanupTrackProcesses(track);
+
+      try {
+        stream.destroy();
+      } catch {}
+
+      return;
+    }
+
+    let resource = null;
+
     stream.on('error', (err) => {
+      // Only react to errors from the stream that is actually playing.
+      // Skipping (or a retry) tears the old stream down, and the resulting
+      // error must not be mistaken for a failure of the next track.
+      if (
+        queue.current !== track ||
+        track.resource !== resource
+      ) {
+        return;
+      }
+
       handleStreamFailure(guildId, err);
     });
 
@@ -901,7 +946,7 @@ async function playCurrentTrack(guildId) {
     // CREATE DISCORD AUDIO RESOURCE
     // ========================================================
 
-    const resource = createAudioResource(stream, {
+    resource = createAudioResource(stream, {
       inputType,
       inlineVolume: true,
     });
@@ -1186,6 +1231,48 @@ async function playNext(
 }
 
 // ============================================================
+// SKIP CURRENT TRACK
+//
+// `expectedTrack` makes sure a skip only ever skips the track the user
+// was looking at, even if it ended on its own a moment earlier.
+// ============================================================
+
+function skipCurrent(guildId, expectedTrack) {
+  const queue = queues.get(guildId);
+
+  if (!queue || !queue.current) {
+    return false;
+  }
+
+  if (expectedTrack && queue.current !== expectedTrack) {
+    return false;
+  }
+
+  const track = queue.current;
+
+  // Stopping the player fires the Idle handler, which moves on to the
+  // next track.
+  queue.skipFlag = true;
+
+  const stopped = queue.player.stop();
+
+  if (!stopped) {
+    // Nothing was audibly playing yet: the track is still starting up (or
+    // being retried), so stop() had nothing to stop. Abandon it ourselves.
+    queue.skipFlag = false;
+    queue.retryPending = false;
+
+    cleanupTrackProcesses(track);
+
+    queue.current = null;
+
+    playNext(guildId);
+  }
+
+  return true;
+}
+
+// ============================================================
 // DESTROY QUEUE
 // ============================================================
 
@@ -1244,5 +1331,6 @@ module.exports = {
   createQueue,
   playNext,
   destroyQueue,
+  skipCurrent,
   durationToSeconds,
 };
