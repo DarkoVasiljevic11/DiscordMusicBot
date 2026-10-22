@@ -42,6 +42,26 @@ function detectSource(query) {
 }
 
 // ============================================================
+// LOCAL YOUTUBE PLAYLIST URL CHECK
+//
+// Used only if play-dl's own validator throws.
+// ============================================================
+
+function isYoutubePlaylistUrl(query) {
+  try {
+    const url = new URL(query);
+
+    return (
+      url.searchParams.has('list') &&
+      (url.pathname === '/playlist' ||
+        !url.searchParams.has('v'))
+    );
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================
 // RUN YT-DLP
 // ============================================================
 
@@ -125,6 +145,17 @@ async function findYoutubeMatch(title, artists) {
       url: video.url,
       durationRaw: video.timestamp,
       durationInSec: video.seconds,
+
+      // The next few results, kept as fallbacks: if the top result can't be
+      // streamed (removed, blocked, a request failing, ...) the player tries
+      // these instead of just skipping the song.
+      alternates: result.videos
+        .slice(1, 4)
+        .filter((v) => v && v.url)
+        .map((v) => ({
+          url: v.url,
+          duration: v.timestamp,
+        })),
     };
   } catch (error) {
     console.error(
@@ -265,7 +296,11 @@ async function getYoutubePlaylistVideos(query) {
           .filter((entry) => {
             return (
               entry &&
-              entry.id
+              entry.id &&
+              // yt-dlp keeps placeholders for removed/private entries.
+              !/^\[(deleted|private) video\]$/i.test(
+                entry.title || ''
+              )
             );
           })
           .map((entry) => {
@@ -440,6 +475,7 @@ async function resolveQuery(
             return {
               title: `${info.title} - ${info.artists}`,
               url: match.url,
+              alternates: match.alternates,
               duration: match.durationRaw,
               source: 'spotify',
               requestedBy,
@@ -533,17 +569,18 @@ async function resolveQuery(
     let type;
 
     try {
-      type =
-        await play.validate(query);
+      type = await play.validate(query);
     } catch (error) {
-      console.error(
-        'YouTube URL validation failed:',
-        error
+      // play-dl failing to validate shouldn't take YouTube links down with
+      // it: fall back to a simple local check of the URL.
+      console.warn(
+        'play.validate() failed, using a local URL check instead:',
+        error.message
       );
 
-      throw new Error(
-        'Could not validate that YouTube URL.'
-      );
+      type = isYoutubePlaylistUrl(query)
+        ? 'yt_playlist'
+        : 'yt_video';
     }
 
     // ========================================================
@@ -684,43 +721,45 @@ async function resolveQuery(
     // NORMAL YOUTUBE SINGLE VIDEO
     // ========================================================
 
-    let info;
+    let track;
 
     try {
-      info =
-        await play.video_basic_info(
-          query
-        );
+      const info = await play.video_basic_info(query);
+      const details = info.video_details;
+
+      if (!details || !details.url) {
+        throw new Error('play-dl returned no URL for that video.');
+      }
+
+      track = {
+        title: details.title,
+        url: details.url,
+        duration: details.durationRaw,
+        source: 'youtube',
+        requestedBy,
+      };
     } catch (error) {
-      console.error(
-        'YouTube video_basic_info() failed:',
-        error
+      // play-dl's info lookup breaks whenever YouTube changes its pages
+      // (e.g. "Got 404 from the request"), so fall back to yt-dlp, which is
+      // already used for /playlong and for playlists.
+      console.warn(
+        `play-dl couldn't read that video (${error.message}). Using yt-dlp instead...`
       );
 
-      throw new Error(
-        'Could not retrieve information for that YouTube video.'
-      );
+      const details = await getYoutubeVideoInfo(query);
+
+      track = {
+        title: details.title || `YouTube video ${details.id}`,
+        url: details.webpage_url || query,
+        duration:
+          details.duration_string ||
+          (typeof details.duration === 'number'
+            ? formatDuration(details.duration)
+            : null),
+        source: 'youtube',
+        requestedBy,
+      };
     }
-
-    const details =
-      info.video_details;
-
-    if (
-      !details ||
-      !details.url
-    ) {
-      throw new Error(
-        'That YouTube video is not playable (no stream URL returned).'
-      );
-    }
-
-    const track = {
-      title: details.title,
-      url: details.url,
-      duration: details.durationRaw,
-      source: 'youtube',
-      requestedBy,
-    };
 
     if (onStart) {
       onStart(1);
@@ -747,6 +786,7 @@ async function resolveQuery(
   const track = {
     title: match.title,
     url: match.url,
+    alternates: match.alternates,
     duration: match.durationRaw,
     source: 'youtube',
     requestedBy,

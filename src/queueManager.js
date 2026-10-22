@@ -52,6 +52,47 @@ const STALL_CHECK_INTERVAL_MS = 10_000;
 const STALLED_AFTER_CHECKS = 2;
 
 // ============================================================
+// YOUTUBE: PLAY-DL VS YT-DLP
+//
+// play-dl scrapes YouTube's pages, so it breaks whenever YouTube changes
+// them (e.g. "Got 404 from the request"). yt-dlp is kept up to date far
+// faster, so it's used as the fallback: if play-dl can't start a YouTube
+// stream and yt-dlp can, the track plays through yt-dlp, and for the next
+// YT_DLP_PREFERRED_FOR_MS every YouTube track goes straight to yt-dlp
+// instead of failing through play-dl first.
+// ============================================================
+
+// Set to true to always use yt-dlp for YouTube and never try play-dl.
+const ALWAYS_USE_YTDLP_FOR_YOUTUBE = false;
+
+const YT_DLP_PREFERRED_FOR_MS = 10 * 60 * 1000;
+
+let preferYtDlpUntil = 0;
+
+// Spotify tracks are played from their matching YouTube video.
+function isYoutubeTrack(track) {
+  return (
+    track.source === 'youtube' ||
+    track.source === 'spotify'
+  );
+}
+
+function shouldUseYtDlp(track) {
+  if (track.longMode || track.ytDlpFallback) {
+    return true;
+  }
+
+  if (!isYoutubeTrack(track)) {
+    return false;
+  }
+
+  return (
+    ALWAYS_USE_YTDLP_FOR_YOUTUBE ||
+    Date.now() < preferYtDlpUntil
+  );
+}
+
+// ============================================================
 // QUEUE ACCESS
 // ============================================================
 
@@ -761,191 +802,184 @@ function handleStreamFailure(
 // PLAY CURRENT TRACK
 // ============================================================
 
-async function playCurrentTrack(
-  guildId
-) {
-  const queue =
-    queues.get(guildId);
+async function playCurrentTrack(guildId) {
+  const queue = queues.get(guildId);
 
-  if (
-    !queue ||
-    !queue.current
-  ) {
+  if (!queue || !queue.current) {
     return;
   }
 
-  const track =
-    queue.current;
+  const track = queue.current;
+
+  // Rejects if `promise` hasn't settled within the start timeout.
+  const withTimeout = (promise, message) => {
+    let timer;
+
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(message)),
+          STREAM_START_TIMEOUT_MS
+        );
+      }),
+    ]).finally(() => clearTimeout(timer));
+  };
+
+  // yt-dlp -> direct CDN URL -> FFmpeg -> Discord-compatible PCM
+  const startWithYtDlp = async () => {
+    const result = await withTimeout(
+      startLongVideoStream(track),
+      'Timed out starting yt-dlp/FFmpeg stream.'
+    );
+
+    return {
+      stream: result.stream,
+      inputType: StreamType.Raw,
+    };
+  };
+
+  // play-dl streaming (SoundCloud, and YouTube while play-dl works)
+  const startWithPlayDl = async () => {
+    const streamOptions = {};
+
+    if (track.seekOffset > 0) {
+      streamOptions.seek = Math.floor(track.seekOffset);
+    }
+
+    const streamInfo = await withTimeout(
+      play.stream(track.url, streamOptions),
+      `Timed out starting stream (play.stream took over ${
+        STREAM_START_TIMEOUT_MS / 1000
+      }s)`
+    );
+
+    return {
+      stream: streamInfo.stream,
+      inputType: streamInfo.type,
+    };
+  };
 
   try {
-    let stream;
-    let inputType;
+    let started;
 
-    // ========================================================
-    // LONG MODE
-    //
-    // yt-dlp -> direct CDN URL
-    // FFmpeg -> Discord-compatible PCM
-    // ========================================================
-
-    if (
-      track.longMode
-    ) {
-      const result =
-        await Promise.race([
-          startLongVideoStream(
-            track
-          ),
-
-          new Promise(
-            (_, reject) =>
-              setTimeout(
-                () =>
-                  reject(
-                    new Error(
-                      'Timed out starting yt-dlp/FFmpeg stream.'
-                    )
-                  ),
-                STREAM_START_TIMEOUT_MS
-              )
-          ),
-        ]);
-
-      stream =
-        result.stream;
-
-      inputType =
-        StreamType.Raw;
-
-      stream.on(
-        'error',
-        (err) => {
-          handleStreamFailure(
-            guildId,
-            err
-          );
+    if (shouldUseYtDlp(track)) {
+      started = await startWithYtDlp();
+    } else {
+      try {
+        started = await startWithPlayDl();
+      } catch (playDlError) {
+        // Only YouTube tracks have a fallback.
+        if (!isYoutubeTrack(track)) {
+          throw playDlError;
         }
-      );
-    }
 
-    // ========================================================
-    // NORMAL MODE
-    //
-    // Existing play-dl behavior.
-    // ========================================================
+        console.warn(
+          `play-dl couldn't start "${track.title}" (${playDlError.message}). Falling back to yt-dlp...`
+        );
 
-    else {
-      const streamOptions =
-        {};
+        cleanupTrackProcesses(track);
 
-      if (
-        track.seekOffset >
-        0
-      ) {
-        streamOptions.seek =
-          Math.floor(
-            track.seekOffset
-          );
+        track.ytDlpFallback = true;
+
+        started = await startWithYtDlp();
+
+        // yt-dlp worked where play-dl didn't, so play-dl is the broken
+        // part: skip it for a while.
+        preferYtDlpUntil =
+          Date.now() + YT_DLP_PREFERRED_FOR_MS;
       }
-
-      const streamInfo =
-        await Promise.race([
-          play.stream(
-            track.url,
-            streamOptions
-          ),
-
-          new Promise(
-            (_, reject) =>
-              setTimeout(
-                () =>
-                  reject(
-                    new Error(
-                      'Timed out starting stream (play.stream took over 20s)'
-                    )
-                  ),
-                STREAM_START_TIMEOUT_MS
-              )
-          ),
-        ]);
-
-      stream =
-        streamInfo.stream;
-
-      inputType =
-        streamInfo.type;
-
-      stream.on(
-        'error',
-        (err) => {
-          handleStreamFailure(
-            guildId,
-            err
-          );
-        }
-      );
     }
+
+    const { stream, inputType } = started;
+
+    stream.on('error', (err) => {
+      handleStreamFailure(guildId, err);
+    });
 
     // ========================================================
     // CREATE DISCORD AUDIO RESOURCE
     // ========================================================
 
-    const resource =
-      createAudioResource(
-        stream,
-        {
-          inputType,
-          inlineVolume: true,
-        }
-      );
+    const resource = createAudioResource(stream, {
+      inputType,
+      inlineVolume: true,
+    });
 
-    resource.volume?.setVolume(
-      queue.volume
-    );
+    resource.volume?.setVolume(queue.volume);
 
-    track.resource =
-      resource;
+    track.resource = resource;
 
-    queue.player.play(
-      resource
-    );
+    queue.player.play(resource);
 
-    track.attemptStartedAt =
-      Date.now();
+    // The replacement stream is playing, so any retry that was in
+    // progress is finished. (Clearing it here, rather than waiting for
+    // the next Idle event, stops a leftover flag from swallowing the
+    // Idle event at the natural end of the resumed track.)
+    queue.retryPending = false;
 
-    if (
-      track.streamAttempt ===
-      0
-    ) {
-      track.startedAt =
-        Date.now();
+    track.attemptStartedAt = Date.now();
+
+    if (track.streamAttempt === 0) {
+      track.startedAt = Date.now();
 
       queue.textChannel
-        ?.send(
-          `🎶 Now playing: **${track.title}**`
-        )
+        ?.send(`🎶 Now playing: **${track.title}**`)
         .catch(() => {});
     }
 
-    startStallWatchdog(
-      guildId,
-      track,
-      resource
-    );
+    startStallWatchdog(guildId, track, resource);
   } catch (err) {
+    queue.retryPending = false;
+
+    cleanupTrackProcesses(track);
+
+    // The track was skipped/cleared while its stream was still starting:
+    // nothing left to recover, and acting now would hit whatever is next.
+    if (queue.current !== track) {
+      return;
+    }
+
+    const resumeNote =
+      track.seekOffset > 0
+        ? `, resuming at ${Math.floor(track.seekOffset)}s`
+        : '';
+
     console.error(
-      'Error starting stream:',
+      `Error starting stream for "${track.title}" (${track.url}${resumeNote}):`,
       err
     );
 
-    cleanupTrackProcesses(
-      track
-    );
+    // Spotify and search results carry a few alternate YouTube matches.
+    // If the best one can't be streamed at all (removed, blocked, ...),
+    // try the next before giving up on the song.
+    if (
+      Array.isArray(track.alternates) &&
+      track.alternates.length > 0
+    ) {
+      const next = track.alternates.shift();
+
+      console.warn(
+        `Trying alternate source for "${track.title}": ${next.url}`
+      );
+
+      track.url = next.url;
+
+      // A different video can have a different length.
+      track.duration = next.duration;
+
+      // Any resume position belonged to the old video.
+      track.seekOffset = 0;
+      track.streamAttempt = 0;
+
+      // New video: try the normal route first again.
+      track.ytDlpFallback = false;
+
+      return playCurrentTrack(guildId);
+    }
 
     queue.textChannel
-      ?.send(
-        `⚠️ Couldn't play **${track.title}**, skipping.`
-      )
+      ?.send(`⚠️ Couldn't play **${track.title}**, skipping.`)
       .catch(() => {});
 
     queue.current = null;
@@ -1136,6 +1170,9 @@ async function playNext(
 
   nextSong.ytDlpProcess =
     null;
+
+  nextSong.ytDlpFallback =
+    false;
 
   queue.current =
     nextSong;
