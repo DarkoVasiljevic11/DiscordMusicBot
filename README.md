@@ -1,5 +1,20 @@
  Discord Music Bot
+Newest update
+>>New Command
 
+/playlist:
+
+It takes text, a .txt file, or both. Each line can be a Spotify, YouTube or SoundCloud link, or a search like Artist - Title.
+Several links on one line also work, as do leading numbers and bullets.
+It joins voice, starts playing as soon as the first songs are found, and reports any lines it couldn’t match.
+Limits: 500 lines and 1000 songs per use.
+The Spotify desktop trick is: open a playlist, press Ctrl+A, Ctrl+C, paste into a .txt, and attach it.
+
+Spotify links:
+
+The bot tries the Spotify API first. If that errors or returns nothing, it reads the playlist’s public page instead and matches each song on YouTube as before.
+It also accepts spotify:track:… links and open.spotify.com/intl-xx/… links.
+If both routes fail, the error message explains why and says what to do.
 
 Update>>playdl from iamtraction misbehaved with certain playlists, decided to use yt-dlp instead which can be found for windows, linux on its official github repo, note that playdl still works but must be updated reguraly and migth produce the same outcome with certain songs, playlists as it did for me
 Update fixes> added new command(/playlong) to be able to play long tracks without checking for lenght and ending the track early, fixed up queue manager to use ytdlp instead of @iamtraction/playdl, edited resolveTrack to handle longer tracks and have the regural play command work 

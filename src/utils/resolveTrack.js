@@ -10,6 +10,10 @@ const {
   getSpotifyPlaylistTrackInfos,
 } = require('./spotify');
 
+const {
+  getPublicSpotifyTrackInfos,
+} = require('./spotifyPublic');
+
 // How many YouTube searches run at once when resolving a big Spotify
 // playlist/album.
 const SPOTIFY_SEARCH_CONCURRENCY = 4;
@@ -39,6 +43,117 @@ function detectSource(query) {
   }
 
   return 'search';
+}
+
+// ============================================================
+// SPOTIFY INPUT NORMALISATION
+//
+// Accepts the two other ways a Spotify item gets shared and turns them
+// into the plain https://open.spotify.com/<type>/<id> form the rest of
+// the code understands:
+//   spotify:track:<id>                       (Spotify URIs)
+//   open.spotify.com/intl-de/track/<id>      (links with a locale)
+// Anything that isn't one of those is returned untouched.
+// ============================================================
+
+function normalizeSpotifyInput(query) {
+  if (typeof query !== 'string') {
+    return query;
+  }
+
+  const trimmed = query.trim();
+
+  const uri = trimmed.match(
+    /^spotify:(track|album|playlist):([A-Za-z0-9]+)$/i
+  );
+
+  if (uri) {
+    return `https://open.spotify.com/${uri[1].toLowerCase()}/${uri[2]}`;
+  }
+
+  return trimmed.replace(
+    /(open\.spotify\.com\/)intl-[a-z]+(?:-[a-z]+)*\//i,
+    '$1'
+  );
+}
+
+// ============================================================
+// SPOTIFY: API FIRST, PUBLIC PAGE SECOND
+//
+// 1. The Spotify Web API (uses your authorised account, so it can read
+//    your private/collaborative playlists).
+// 2. If the API fails - or returns nothing - Spotify's public page, which
+//    still works for Spotify's own editorial playlists (the API refuses
+//    those for every app). Capped at 100 tracks, see ./spotifyPublic.js.
+// ============================================================
+
+async function getSpotifyInfosFromApi(parsed) {
+  if (parsed.type === 'track') {
+    return getSpotifyTrackInfo(parsed.id);
+  }
+
+  if (parsed.type === 'album') {
+    return getSpotifyAlbumTrackInfos(parsed.id);
+  }
+
+  return getSpotifyPlaylistTrackInfos(parsed.id);
+}
+
+// First line only, and not absurdly long, so two combined error messages
+// still fit in a Discord reply.
+function shortMessage(error, max = 200) {
+  const text = String(
+    (error && error.message) || error || 'unknown error'
+  )
+    .split('\n')[0]
+    .trim()
+    .replace(/[.\s]+$/, '');
+
+  return text.length > max
+    ? `${text.slice(0, max - 1)}…`
+    : text;
+}
+
+async function getSpotifyInfos(parsed) {
+  let apiError = null;
+
+  try {
+    const infos = await getSpotifyInfosFromApi(parsed);
+
+    if (Array.isArray(infos) && infos.length > 0) {
+      return infos;
+    }
+
+    console.warn(
+      `Spotify API returned no songs for that ${parsed.type}. Trying Spotify's public page instead...`
+    );
+  } catch (error) {
+    apiError = error;
+
+    console.warn(
+      `Spotify API couldn't read that ${parsed.type} (${shortMessage(error)}). Trying Spotify's public page instead...`
+    );
+  }
+
+  try {
+    return await getPublicSpotifyTrackInfos(
+      parsed.type,
+      parsed.id
+    );
+  } catch (publicError) {
+    const apiPart = apiError
+      ? `The Spotify API said: ${shortMessage(apiError)}. `
+      : 'The Spotify API returned no songs. ';
+
+    const hint =
+      parsed.type === 'track'
+        ? ''
+        : " Spotify's own personalised mixes (Discover Weekly, Daily Mix, Release Radar...) can't be read by any bot, and private playlists need to be made public. You can copy the songs into a public playlist of your own, or use /playlist with a list of the songs.";
+
+    throw new Error(
+      `Couldn't read that Spotify ${parsed.type}. ${apiPart}Spotify's public page couldn't be read either: ${shortMessage(publicError)}.${hint}`
+    );
+  }
 }
 
 // ============================================================
@@ -388,6 +503,8 @@ async function resolveQuery(
     longMode = false,
   } = {}
 ) {
+  query = normalizeSpotifyInput(query);
+
   const source = detectSource(query);
 
   const emit = (tracks) => {
@@ -429,26 +546,8 @@ async function resolveQuery(
       );
     }
 
-    let infos;
-
-    if (parsed.type === 'track') {
-      infos =
-        await getSpotifyTrackInfo(
-          parsed.id
-        );
-    } else if (
-      parsed.type === 'album'
-    ) {
-      infos =
-        await getSpotifyAlbumTrackInfos(
-          parsed.id
-        );
-    } else {
-      infos =
-        await getSpotifyPlaylistTrackInfos(
-          parsed.id
-        );
-    }
+    const infos =
+      await getSpotifyInfos(parsed);
 
     if (onStart) {
       onStart(infos.length);
